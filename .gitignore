@@ -1,0 +1,33 @@
+# ── Secrets ────────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets/
+
+# ── Node ───────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ── Hardhat ────────────────────────────────────────────────────────────────
+# Recompiled on every build — keep `contracts/`, `scripts/`, `test/` instead.
+cache/
+artifacts/
+typechain/
+typechain-types/
+
+# ── Coverage / gas reports ─────────────────────────────────────────────────
+coverage/
+coverage.json
+gas-report.txt
+
+# ── Editor / OS ────────────────────────────────────────────────────────────
+.DS_Store
+*.log
+*.swp
+.idea/
+.vscode/
