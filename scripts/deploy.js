@@ -1,118 +1,85 @@
 /**
- * Medichain Deployment Script — Approach 2 (Hybrid)
- * ──────────────────────────────────────────────────
- * Only ONE contract needs to be deployed:
- *   MediAccessControl — handles access grants + immutable audit log
- *
- * Supabase handles: auth, user profiles, record metadata
- * IPFS handles: encrypted file storage
- * This contract handles: access control + audit trail only
+ * MediChain deployment
+ * ────────────────────
+ * Deploys two contracts:
+ *   1. MediChainForwarder — OpenZeppelin ERC-2771 forwarder. The backend relayer
+ *      submits users' signed requests through it and pays their gas.
+ *   2. MediAccessControl  — access grants + immutable audit log, trusting (1).
  *
  * Usage:
- *   npx hardhat run scripts/deploy.js --network hardhat    (local — instant, free)
- *   npx hardhat run scripts/deploy.js --network amoy       (Polygon testnet)
+ *   npx hardhat run scripts/deploy.js --network localhost  (local node)
+ *   npx hardhat run scripts/deploy.js --network amoy       (Polygon Amoy testnet)
  *   npx hardhat run scripts/deploy.js --network polygon    (Polygon mainnet)
+ *
+ * Addresses are written to deployments/<network>.json.
  */
 
 const { ethers, network } = require("hardhat");
-const fs                   = require("fs");
-const path                 = require("path");
-require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
 
-function getRpcUrl() {
-  if (network.name === "hardhat" || network.name === "localhost") {
-    return "http://127.0.0.1:8545";
-  }
-  if (network.name === "amoy") return process.env.POLYGON_AMOY_RPC_URL;
-  return process.env.POLYGON_MAINNET_RPC_URL;
-}
+const EXPLORERS = {
+  amoy: "https://amoy.polygonscan.com",
+  polygon: "https://polygonscan.com",
+};
 
-async function waitForTx(txHash, confirmations = 2) {
-  console.log(`     ⏳ Waiting for confirmation (tx: ${txHash.slice(0, 12)}...)`);
+// Public networks need a couple of confirmations before we trust the address.
+const CONFIRMATIONS = network.name === "hardhat" || network.name === "localhost" ? 1 : 2;
 
-  // Local Hardhat network — tx is instant
-  if (network.name === "hardhat" || network.name === "localhost") {
-    console.log(`     ✅ Local network — confirmed instantly`);
-    return;
-  }
-
-  // Testnet / Mainnet — poll until confirmed
-  const rawProvider = new ethers.JsonRpcProvider(getRpcUrl());
-  for (let i = 0; i < 60; i++) {
-    try {
-      const receipt = await rawProvider.getTransactionReceipt(txHash);
-      if (receipt && receipt.blockNumber) {
-        const currentBlock = await rawProvider.getBlockNumber();
-        if (currentBlock >= receipt.blockNumber + confirmations - 1) {
-          return receipt;
-        }
-      }
-    } catch (_) {}
-    await new Promise(r => setTimeout(r, 3000));
-  }
-  throw new Error(`Timeout waiting for tx ${txHash}`);
+async function deploy(name, args = []) {
+  console.log(`Deploying ${name}...`);
+  const factory = await ethers.getContractFactory(name);
+  const contract = await factory.deploy(...args);
+  const tx = contract.deploymentTransaction();
+  console.log(`  tx ${tx.hash} — waiting for ${CONFIRMATIONS} confirmation(s)`);
+  await tx.wait(CONFIRMATIONS);
+  const address = await contract.getAddress();
+  console.log(`  ✔ ${name} → ${address}\n`);
+  return address;
 }
 
 async function main() {
   const [deployer] = await ethers.getSigners();
-
-  console.log("\n╔══════════════════════════════════════════════════╗");
-  console.log("║       MEDICHAIN CONTRACT DEPLOYMENT              ║");
-  console.log("║       Approach 2 — Hybrid Architecture           ║");
-  console.log("╚══════════════════════════════════════════════════╝\n");
-  console.log(`Network   : ${network.name}`);
-  console.log(`Deployer  : ${deployer.address}`);
-
   const balance = await ethers.provider.getBalance(deployer.address);
-  console.log(`Balance   : ${ethers.formatEther(balance)} MATIC\n`);
+  const { chainId } = await ethers.provider.getNetwork();
 
-  // ── Deploy MediAccessControl ─────────────────────────────────────────
-  console.log("Deploying MediAccessControl...");
-  const MediAccessControl = await ethers.getContractFactory("MediAccessControl");
-  const accessTx          = await MediAccessControl.deploy();
-  const accessAddress     = await accessTx.getAddress();
-  await waitForTx(accessTx.deploymentTransaction().hash);
-  console.log(`     ✔  MediAccessControl → ${accessAddress}`);
+  console.log(`\nNetwork  : ${network.name} (chain ${chainId})`);
+  console.log(`Deployer : ${deployer.address}`);
+  console.log(`Balance  : ${ethers.formatEther(balance)} POL\n`);
 
-  // ── Summary ───────────────────────────────────────────────────────────
-  console.log("\n╔══════════════════════════════════════════════════╗");
-  console.log("║                DEPLOYMENT COMPLETE               ║");
-  console.log("╠══════════════════════════════════════════════════╣");
-  console.log(`║  MediAccessControl : ${accessAddress}  ║`);
-  console.log("╠══════════════════════════════════════════════════╣");
-  console.log("║  Supabase          : handles auth + metadata      ║");
-  console.log("║  IPFS              : handles encrypted files       ║");
-  console.log("║  MediAccessControl : handles access + audit log   ║");
-  console.log("╚══════════════════════════════════════════════════╝\n");
+  if (balance === 0n) {
+    throw new Error("Deployer has no funds. Get test POL from https://faucet.polygon.technology/");
+  }
 
-  // ── Save address to JSON ──────────────────────────────────────────────
-  const networkInfo  = await ethers.provider.getNetwork();
-  const deployedData = {
-    approach:    "Hybrid (Approach 2)",
-    network:     network.name,
-    chainId:     networkInfo.chainId.toString(),
-    deployedAt:  new Date().toISOString(),
-    deployer:    deployer.address,
+  const forwarder = await deploy("MediChainForwarder");
+  const accessControl = await deploy("MediAccessControl", [forwarder]);
+
+  const explorer = EXPLORERS[network.name] || null;
+  const deployment = {
+    network: network.name,
+    chainId: chainId.toString(),
+    deployedAt: new Date().toISOString(),
+    deployer: deployer.address,
     contracts: {
-      MediAccessControl: accessAddress,
+      MediChainForwarder: forwarder,
+      MediAccessControl: accessControl,
     },
-    notes: {
-      identity:       "Managed by Supabase Auth",
-      recordMetadata: "Managed by Supabase Database",
-      fileStorage:    "Managed by IPFS (Pinata)",
-      accessControl:  "Managed by MediAccessControl contract",
-      auditLog:       "Immutable on-chain via MediAccessControl events",
-    },
+    explorer,
   };
 
-  const outDir  = path.join(__dirname, "../deployments");
-  const outFile = path.join(outDir, `${network.name}.json`);
+  const outDir = path.join(__dirname, "../deployments");
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(path.join(outDir, `${network.name}.json`), JSON.stringify(deployment, null, 2) + "\n");
 
-  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
-  fs.writeFileSync(outFile, JSON.stringify(deployedData, null, 2));
-
-  console.log(`Contract address saved to: deployments/${network.name}.json`);
-  console.log("Add this address to your Flutter app config.\n");
+  console.log(`Saved to deployments/${network.name}.json\n`);
+  console.log("Backend .env settings:");
+  console.log(`  BLOCKCHAIN_CHAIN_ID=${chainId}`);
+  console.log(`  CONTRACT_ADDRESS=${accessControl}`);
+  console.log(`  FORWARDER_ADDRESS=${forwarder}`);
+  if (explorer) {
+    console.log(`  BLOCKCHAIN_EXPLORER_URL=${explorer}`);
+    console.log(`\nView on explorer: ${explorer}/address/${accessControl}`);
+  }
 }
 
 main().catch((err) => {

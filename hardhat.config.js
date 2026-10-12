@@ -4,8 +4,10 @@ require("dotenv").config();
 /** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {
   solidity: {
-    version: "0.8.20",
+    version: "0.8.24",
     settings: {
+      // OpenZeppelin 5.x uses MCOPY; Polygon Amoy and mainnet run Cancun.
+      evmVersion: "cancun",
       optimizer: {
         enabled: true,
         runs: 200,
@@ -21,10 +23,10 @@ module.exports = {
 
     // ── Polygon Amoy (testnet — replaced Mumbai in 2024) ──────────────
     amoy: {
-      url: process.env.POLYGON_AMOY_RPC_URL || "https://rpc-amoy.polygon.technology",
+      url: process.env.POLYGON_AMOY_RPC_URL || "https://polygon-amoy-bor-rpc.publicnode.com",
       chainId: 80002,
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
-      gasPrice: 25000000000, // 25 Gwei — Amoy minimum required
+      // Gas price is estimated live; Amoy fees swing well above the 25 gwei floor.
     },
 
     // ── Polygon Mainnet ────────────────────────────────────────────────

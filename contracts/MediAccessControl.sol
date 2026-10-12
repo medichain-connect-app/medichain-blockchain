@@ -1,40 +1,33 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
+
+import {ERC2771Context} from "@openzeppelin/contracts/metatx/ERC2771Context.sol";
 
 /**
  * @title  MediAccessControl
- * @notice Approach 2 — Hybrid Architecture
+ * @notice Hybrid architecture — the chain is the tamper-proof record of WHO may
+ *         access WHICH record and WHAT they did with it.
  *
- *  What this contract does:
  *  ┌──────────────────────────────────────────────────────────────────┐
- *  │  Supabase  →  handles auth, user profiles, record metadata       │
- *  │  IPFS      →  stores the actual encrypted medical files          │
- *  │  THIS CONTRACT →  handles ONLY:                                  │
- *  │    1. Access control  (who can decrypt which record)             │
- *  │    2. Encrypted key   (AES key re-encrypted for each doctor)     │
- *  │    3. Audit log       (immutable on-chain log of every access)   │
+ *  │  Supabase  →  auth, user profiles, record metadata, AES keys     │
+ *  │  IPFS      →  the encrypted medical files                        │
+ *  │  THIS CONTRACT →                                                 │
+ *  │    1. Access grants (patient → doctor, per record, with expiry)  │
+ *  │    2. Immutable audit log (granted / revoked / viewed / download)│
  *  └──────────────────────────────────────────────────────────────────┘
  *
- *  Record ID:
- *    recordId is a bytes32 — computed in Flutter as:
- *    keccak256(utf8.encode(supabaseRecordUUID))
- *    This links a Supabase record to its on-chain access control entry.
+ *  No decryption keys are stored here. Everything on a public chain — storage
+ *  and transaction input — is readable by anyone, so keys stay off-chain.
  *
- *  Key Flow:
- *    Upload  : Patient encrypts file (AES-256) → uploads to IPFS → stores
- *              metadata in Supabase. No contract call needed yet.
+ *  Record ID:  keccak256(utf8(supabaseRecordUUID)), linking a Supabase record
+ *              to its on-chain grants and log.
  *
- *    Share   : Patient re-encrypts AES key with doctor's public key (off-chain
- *              in Flutter), then calls grantAccess(). Encrypted key stored here.
- *
- *    Access  : Doctor calls getEncryptedKey() → decrypts with own private key
- *              locally → fetches IPFS file → decrypts with AES key.
- *              Doctor then calls logView() or logDownload() for the audit log.
- *
- *    Revoke  : Patient calls revokeAccess() → doctor's encrypted key is wiped
- *              from storage, grant deactivated. Future getEncryptedKey() reverts.
+ *  Gas:  users never hold gas. Each user's wallet signs an EIP-712 request and
+ *        the backend relayer submits it through the trusted ERC2771Forwarder,
+ *        paying the gas. `_msgSender()` is still the signing user, so ownership
+ *        and access checks work exactly as if the user had sent the transaction.
  */
-contract MediAccessControl {
+contract MediAccessControl is ERC2771Context {
 
     // ─────────────────────────────────────────────
     //  Types
@@ -42,40 +35,40 @@ contract MediAccessControl {
 
     enum ActionType { GRANTED, REVOKED, VIEWED, DOWNLOADED }
 
+    // Fields are ordered and sized to pack into two storage slots each — the
+    // relayer pays for every write, so storage is kept as small as possible.
+    // The recordId is the mapping key, so it isn't stored again.
+
     struct AccessGrant {
         address doctor;
-        address patient;
-        bytes32 recordId;
-        string  encryptedKeyForDoctor;  // AES key re-encrypted with doctor's public key
-        uint256 grantedAt;
-        uint256 expiresAt;              // 0 = no expiry
+        uint64  grantedAt;
         bool    isActive;
+        address patient;
+        uint64  expiresAt;   // 0 = no expiry
     }
 
     struct AccessLog {
         address    doctor;
-        address    patient;
-        bytes32    recordId;
+        uint64     timestamp;
         ActionType action;
-        uint256    timestamp;
-        uint256    blockNumber;
+        address    patient;
+        uint64     blockNumber;
     }
 
     // ─────────────────────────────────────────────
     //  State
     // ─────────────────────────────────────────────
 
-    // recordId → patient address (set on first grantAccess call)
-    // This is how the contract knows who "owns" a record without IdentityRegistry
+    // recordId → patient address (set on the first grantAccess call)
     mapping(bytes32 => address) private _recordOwner;
 
     // recordId → doctor → grant
     mapping(bytes32 => mapping(address => AccessGrant)) private _grants;
 
-    // recordId → all doctors ever granted access (for enumeration)
+    // recordId → every doctor ever granted access (each listed once)
     mapping(bytes32 => address[]) private _recordDoctors;
 
-    // doctor → all recordIds ever shared with them
+    // doctor → every recordId ever shared with them (each listed once)
     mapping(address => bytes32[]) private _doctorRecords;
 
     // recordId → full chronological audit log
@@ -116,107 +109,79 @@ contract MediAccessControl {
         uint256 blockNumber
     );
 
+    constructor(address trustedForwarder) ERC2771Context(trustedForwarder) {}
+
     // ─────────────────────────────────────────────
     //  Modifiers
     // ─────────────────────────────────────────────
 
     /**
-     * @dev Ensures caller is the patient who owns the record.
-     *      On first call for a new recordId the caller becomes the owner.
+     * @dev Ensures the caller is the patient who owns the record.
+     *      On the first call for a new recordId the caller becomes the owner.
      */
     modifier onlyRecordOwner(bytes32 recordId) {
+        address sender = _msgSender();
         if (_recordOwner[recordId] == address(0)) {
-            // First time this record is seen — register caller as owner
-            _recordOwner[recordId] = msg.sender;
+            _recordOwner[recordId] = sender;
         }
         require(
-            _recordOwner[recordId] == msg.sender,
+            _recordOwner[recordId] == sender,
             "MediAccessControl: caller is not the record owner"
         );
         _;
     }
 
-    /**
-     * @dev Ensures the calling doctor has an active, non-expired grant.
-     */
+    /// @dev Ensures the calling doctor has an active, non-expired grant.
     modifier hasValidAccess(bytes32 recordId) {
-        AccessGrant storage g = _grants[recordId][msg.sender];
-        require(g.isActive, "MediAccessControl: access not granted");
-        require(
-            g.expiresAt == 0 || block.timestamp <= g.expiresAt,
-            "MediAccessControl: access has expired"
-        );
+        require(_isValid(_grants[recordId][_msgSender()]), "MediAccessControl: no valid access");
         _;
     }
 
     // ─────────────────────────────────────────────
-    //  Patient: Grant Access
+    //  Patient: grant / revoke
     // ─────────────────────────────────────────────
 
     /**
-     * @notice Patient grants a doctor access to one specific record.
-     *
-     * @param doctor                 Wallet address of the doctor.
-     * @param recordId               keccak256 of the Supabase record UUID.
-     * @param encryptedKeyForDoctor  AES key re-encrypted with doctor's public key
-     *                               (done off-chain in Flutter before calling this).
-     * @param expiresAt              Unix timestamp for expiry, or 0 for permanent.
+     * @notice Patient grants a doctor access to one record.
+     * @param doctor     Wallet address of the doctor.
+     * @param recordId   keccak256 of the Supabase record UUID.
+     * @param expiresAt  Unix timestamp for expiry, or 0 for permanent.
      */
-    function grantAccess(
-        address doctor,
-        bytes32 recordId,
-        string  calldata encryptedKeyForDoctor,
-        uint256 expiresAt
-    )
+    function grantAccess(address doctor, bytes32 recordId, uint256 expiresAt)
         external
         onlyRecordOwner(recordId)
     {
-        require(doctor != address(0),                    "MediAccessControl: invalid doctor address");
-        require(doctor != msg.sender,                    "MediAccessControl: cannot grant access to yourself");
-        require(bytes(encryptedKeyForDoctor).length > 0, "MediAccessControl: encrypted key required");
+        address patient = _msgSender();
+        require(doctor != address(0), "MediAccessControl: invalid doctor address");
+        require(doctor != patient,     "MediAccessControl: cannot grant access to yourself");
         require(
-            expiresAt == 0 || expiresAt > block.timestamp,
-            "MediAccessControl: expiry must be in the future"
+            expiresAt == 0 || (expiresAt > block.timestamp && expiresAt <= type(uint64).max),
+            "MediAccessControl: invalid expiry"
         );
         require(
-            !_grants[recordId][doctor].isActive,
+            !_isValid(_grants[recordId][doctor]),
             "MediAccessControl: access already granted, revoke first"
         );
 
+        // Only list a doctor/record pair once, however often it is re-granted.
+        if (_grants[recordId][doctor].grantedAt == 0) {
+            _recordDoctors[recordId].push(doctor);
+            _doctorRecords[doctor].push(recordId);
+        }
+
         _grants[recordId][doctor] = AccessGrant({
-            doctor:                doctor,
-            patient:               msg.sender,
-            recordId:              recordId,
-            encryptedKeyForDoctor: encryptedKeyForDoctor,
-            grantedAt:             block.timestamp,
-            expiresAt:             expiresAt,
-            isActive:              true
+            doctor:    doctor,
+            grantedAt: uint64(block.timestamp),
+            isActive:  true,
+            patient:   patient,
+            expiresAt: uint64(expiresAt)
         });
 
-        _recordDoctors[recordId].push(doctor);
-        _doctorRecords[doctor].push(recordId);
-
-        _accessLogs[recordId].push(AccessLog({
-            doctor:      doctor,
-            patient:     msg.sender,
-            recordId:    recordId,
-            action:      ActionType.GRANTED,
-            timestamp:   block.timestamp,
-            blockNumber: block.number
-        }));
-
-        emit AccessGranted(doctor, msg.sender, recordId, expiresAt, block.timestamp);
+        _log(doctor, patient, recordId, ActionType.GRANTED);
+        emit AccessGranted(doctor, patient, recordId, expiresAt, block.timestamp);
     }
 
-    // ─────────────────────────────────────────────
-    //  Patient: Revoke Access
-    // ─────────────────────────────────────────────
-
-    /**
-     * @notice Patient revokes a doctor's access to a record.
-     *         The encrypted key is wiped from storage immediately.
-     *         Doctor's next call to getEncryptedKey() will revert.
-     */
+    /// @notice Patient revokes a doctor's access to a record.
     function revokeAccess(address doctor, bytes32 recordId)
         external
         onlyRecordOwner(recordId)
@@ -226,109 +191,43 @@ contract MediAccessControl {
             "MediAccessControl: no active access to revoke"
         );
 
-        _grants[recordId][doctor].isActive             = false;
-        _grants[recordId][doctor].encryptedKeyForDoctor = "";  // wipe the key
+        _grants[recordId][doctor].isActive = false;
 
-        _accessLogs[recordId].push(AccessLog({
-            doctor:      doctor,
-            patient:     msg.sender,
-            recordId:    recordId,
-            action:      ActionType.REVOKED,
-            timestamp:   block.timestamp,
-            blockNumber: block.number
-        }));
-
-        emit AccessRevoked(doctor, msg.sender, recordId, block.timestamp);
+        address patient = _msgSender();
+        _log(doctor, patient, recordId, ActionType.REVOKED);
+        emit AccessRevoked(doctor, patient, recordId, block.timestamp);
     }
 
     // ─────────────────────────────────────────────
-    //  Doctor: Get Encrypted Key
+    //  Doctor: audit-log actions
     // ─────────────────────────────────────────────
 
-    /**
-     * @notice Doctor retrieves the AES decryption key encrypted for them.
-     *         Reverts if access was never granted, revoked, or expired.
-     *
-     *         The doctor decrypts this key locally using their private key,
-     *         then uses the resulting AES key to decrypt the IPFS file.
-     *
-     * @param  recordId  The record to access.
-     * @return           Base64-encoded AES key encrypted with doctor's public key.
-     */
-    function getEncryptedKey(bytes32 recordId)
-        external
-        view
-        hasValidAccess(recordId)
-        returns (string memory)
-    {
-        return _grants[recordId][msg.sender].encryptedKeyForDoctor;
-    }
-
-    // ─────────────────────────────────────────────
-    //  Doctor: Log Actions (audit trail)
-    // ─────────────────────────────────────────────
-
-    /**
-     * @notice Doctor logs a VIEW action — call this after opening a record.
-     *         Emits RecordViewed and appends to the immutable on-chain audit log.
-     */
-    function logView(bytes32 recordId)
-        external
-        hasValidAccess(recordId)
-    {
+    /// @notice Doctor logs that they opened a record.
+    function logView(bytes32 recordId) external hasValidAccess(recordId) {
+        address doctor  = _msgSender();
         address patient = _recordOwner[recordId];
-
-        _accessLogs[recordId].push(AccessLog({
-            doctor:      msg.sender,
-            patient:     patient,
-            recordId:    recordId,
-            action:      ActionType.VIEWED,
-            timestamp:   block.timestamp,
-            blockNumber: block.number
-        }));
-
-        emit RecordViewed(msg.sender, patient, recordId, block.timestamp, block.number);
+        _log(doctor, patient, recordId, ActionType.VIEWED);
+        emit RecordViewed(doctor, patient, recordId, block.timestamp, block.number);
     }
 
-    /**
-     * @notice Doctor logs a DOWNLOAD action — call this after downloading a record.
-     *         Emits RecordDownloaded and appends to the immutable on-chain audit log.
-     */
-    function logDownload(bytes32 recordId)
-        external
-        hasValidAccess(recordId)
-    {
+    /// @notice Doctor logs that they downloaded a record.
+    function logDownload(bytes32 recordId) external hasValidAccess(recordId) {
+        address doctor  = _msgSender();
         address patient = _recordOwner[recordId];
-
-        _accessLogs[recordId].push(AccessLog({
-            doctor:      msg.sender,
-            patient:     patient,
-            recordId:    recordId,
-            action:      ActionType.DOWNLOADED,
-            timestamp:   block.timestamp,
-            blockNumber: block.number
-        }));
-
-        emit RecordDownloaded(msg.sender, patient, recordId, block.timestamp, block.number);
+        _log(doctor, patient, recordId, ActionType.DOWNLOADED);
+        emit RecordDownloaded(doctor, patient, recordId, block.timestamp, block.number);
     }
 
     // ─────────────────────────────────────────────
-    //  Query Functions
+    //  Queries
     // ─────────────────────────────────────────────
 
-    /// @notice Check if a doctor currently has valid (active + non-expired) access.
-    function hasAccess(address doctor, bytes32 recordId)
-        external
-        view
-        returns (bool)
-    {
-        AccessGrant storage g = _grants[recordId][doctor];
-        if (!g.isActive) return false;
-        if (g.expiresAt != 0 && block.timestamp > g.expiresAt) return false;
-        return true;
+    /// @notice True if the doctor currently has active, non-expired access.
+    function hasAccess(address doctor, bytes32 recordId) external view returns (bool) {
+        return _isValid(_grants[recordId][doctor]);
     }
 
-    /// @notice Returns full grant details for a doctor-record pair.
+    /// @notice Full grant details for a doctor/record pair.
     function getAccessDetails(address doctor, bytes32 recordId)
         external
         view
@@ -337,72 +236,52 @@ contract MediAccessControl {
         return _grants[recordId][doctor];
     }
 
-    /**
-     * @notice Returns the full chronological audit log for a record.
-     *         Contains every GRANT, REVOKE, VIEW, DOWNLOAD — immutable and
-     *         tamper-proof. Anyone can read this (it's public).
-     */
-    function getAccessLog(bytes32 recordId)
-        external
-        view
-        returns (AccessLog[] memory)
-    {
+    /// @notice Full chronological audit log for a record.
+    function getAccessLog(bytes32 recordId) external view returns (AccessLog[] memory) {
         return _accessLogs[recordId];
     }
 
-    /// @notice Returns all doctor addresses ever granted access to a record.
-    function getDoctorsWithAccess(bytes32 recordId)
-        external
-        view
-        returns (address[] memory)
-    {
+    /// @notice Every doctor ever granted access to a record.
+    function getDoctorsWithAccess(bytes32 recordId) external view returns (address[] memory) {
         return _recordDoctors[recordId];
     }
 
-    /// @notice Returns the patient (owner) of a record.
-    function getRecordOwner(bytes32 recordId)
-        external
-        view
-        returns (address)
-    {
+    /// @notice The patient who owns a record.
+    function getRecordOwner(bytes32 recordId) external view returns (address) {
         return _recordOwner[recordId];
     }
 
-    /// @notice Doctor: returns all record IDs ever shared with caller.
-    function getMySharedRecords()
-        external
-        view
-        returns (bytes32[] memory)
-    {
-        return _doctorRecords[msg.sender];
-    }
-
-    /// @notice Returns only currently active (non-revoked, non-expired) records for a doctor.
-    function getActiveRecordsForDoctor(address doctor)
-        external
-        view
-        returns (bytes32[] memory)
-    {
-        bytes32[] storage all   = _doctorRecords[doctor];
-        uint256            count = 0;
-
+    /// @notice Records currently (active + non-expired) shared with a doctor.
+    function getActiveRecordsForDoctor(address doctor) external view returns (bytes32[] memory) {
+        bytes32[] storage all = _doctorRecords[doctor];
+        uint256 count = 0;
         for (uint256 i = 0; i < all.length; i++) {
-            AccessGrant storage g = _grants[all[i]][doctor];
-            if (g.isActive && (g.expiresAt == 0 || block.timestamp <= g.expiresAt)) {
-                count++;
-            }
+            if (_isValid(_grants[all[i]][doctor])) count++;
         }
 
         bytes32[] memory active = new bytes32[](count);
-        uint256   idx           = 0;
-
+        uint256 idx = 0;
         for (uint256 i = 0; i < all.length; i++) {
-            AccessGrant storage g = _grants[all[i]][doctor];
-            if (g.isActive && (g.expiresAt == 0 || block.timestamp <= g.expiresAt)) {
-                active[idx++] = all[i];
-            }
+            if (_isValid(_grants[all[i]][doctor])) active[idx++] = all[i];
         }
-
         return active;
+    }
+
+    // ─────────────────────────────────────────────
+    //  Internal
+    // ─────────────────────────────────────────────
+
+    function _isValid(AccessGrant storage g) private view returns (bool) {
+        return g.isActive && (g.expiresAt == 0 || block.timestamp <= g.expiresAt);
+    }
+
+    function _log(address doctor, address patient, bytes32 recordId, ActionType action) private {
+        _accessLogs[recordId].push(AccessLog({
+            doctor:      doctor,
+            timestamp:   uint64(block.timestamp),
+            action:      action,
+            patient:     patient,
+            blockNumber: uint64(block.number)
+        }));
     }
 }
