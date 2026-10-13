@@ -1,0 +1,11 @@
+{
+  "network": "amoy",
+  "chainId": "80002",
+  "deployedAt": "2026-10-13T06:25:04.238Z",
+  "deployer": "0xEd99B7d240833Fa1726B9eb5ba1C5Ae008f21B77",
+  "contracts": {
+    "MediChainForwarder": "0x8e2611C131D9Fc224289DDb377809a4C28832F7F",
+    "MediAccessControl": "0xEE55318e948c71ecD1dee1284DeDc94CeAf2D2cd"
+  },
+  "explorer": "https://amoy.polygonscan.com"
+}

@@ -26,7 +26,9 @@ module.exports = {
       url: process.env.POLYGON_AMOY_RPC_URL || "https://polygon-amoy-bor-rpc.publicnode.com",
       chainId: 80002,
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
-      // Gas price is estimated live; Amoy fees swing well above the 25 gwei floor.
+      // Amoy's base fee is ~0 and 25 gwei is the minimum tip, but nodes often
+      // suggest 100–250 gwei. Pay a fixed price just above the floor instead.
+      gasPrice: Number(process.env.AMOY_GAS_PRICE_GWEI || 35) * 1e9,
     },
 
     // ── Polygon Mainnet ────────────────────────────────────────────────
